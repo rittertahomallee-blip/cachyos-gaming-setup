@@ -1,0 +1,1112 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# CachyOS Gaming Setup
+# Inspiriert von: Arch Wiki, CachyOS, pacman-contrib + bewährten Desktop-Setups
+# Target: CachyOS KDE on BTRFS | fresh installation
+# What it does: reproducible gaming setup, curated app selection, safe maintenance
+# ==============================================================================
+set -Euo pipefail
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; NC='\033[0m'
+
+# One run = one full log plus a separate error log.
+LOG_DIR="$HOME/cachyos-logs"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="$LOG_DIR/install_${RUN_ID}.log"
+ERROR_LOG="$LOG_DIR/errors_${RUN_ID}.log"
+LOG="$LOG_FILE" # Kompatibilität mit der Abschlussmeldung weiter unten
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE" "$ERROR_LOG"
+exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" "$ERROR_LOG" >&2)
+
+log_time(){ date '+%Y-%m-%d %H:%M:%S'; }
+log(){ echo -e "${GREEN}[✓ $(log_time)]${NC} $1"; }
+info(){ echo -e "${CYAN}[→ $(log_time)]${NC} $1"; }
+warn(){ echo -e "${YELLOW}[! $(log_time)]${NC} $1"; }
+fail(){ echo -e "${RED}[✖ $(log_time)]${NC} $1"; }
+
+# Gaming mode: EXTREME = max performance with conscious trade-off (mitigations=off, Coolbits etc.)
+# Set to false for daily driver → SAFE MODE (safe, balanced)
+GAMING_EXTREME=true
+# GPU detection for hardware-specific drivers (NVIDIA only on NVIDIA)
+GPU_VENDOR="unknown"
+if lspci 2>/dev/null | grep -qi "nvidia"; then GPU_VENDOR="nvidia"
+elif lspci 2>/dev/null | grep -qiE "amd.*vga|amd.*graphics|Radeon" -i; then GPU_VENDOR="amd"
+elif lspci 2>/dev/null | grep -qi "intel.*graphics"; then GPU_VENDOR="intel"
+fi
+log "GPU: $GPU_VENDOR | Gaming-Extreme: $GAMING_EXTREME"
+step(){ echo -e "\n${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n${MAGENTA}  $1${NC}\n${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
+on_error(){
+  local status="$1" line="$2" command="$3" quoted_command
+  printf -v quoted_command '%q' "$command"
+  printf '[FEHLER %s] Zeile %s: Befehl %s fehlgeschlagen (Status %s)\n' "$(log_time)" "$line" "$quoted_command" "$status" >> "$ERROR_LOG"
+  warn "Zeile $line fehlgeschlagen (Status $status) – Details: $ERROR_LOG"
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+echo -e "${BLUE}Full log: $LOG_FILE${NC}"
+echo -e "${RED}Errors only:       $ERROR_LOG${NC}\n"
+if ! sudo -v; then
+  fail "Sudo authorization failed – aborting without changes."
+  exit 1
+fi
+
+# ---------- 0. SYSTEMPRÜFUNG ----------
+step "0/8 SYSTEM CHECK - check requirements and system status"
+info "Secure Boot check (must be OFF, otherwise Invalid signature)"
+sbctl status 2>/dev/null | grep -q "Secure Boot.*Enabled" && warn "Secure Boot ON! Disable in BIOS" || log "Secure Boot off - good"
+info "Boot partition check (Windows 100MB too small -> 2GB needed)"
+df -h /boot | tail -1 | awk '{print "Boot:", $2, "total", $4, "frei"}'
+df /boot | awk 'NR==2{if($4<500000) exit 1}' || warn "Boot low! 2GB recommended"
+info "BTRFS Kernel 6.15 Bug Check (warning only, no abort on request)"
+if uname -r | grep -q "6\.15"; then
+  warn "6.15 BTRFS Bug! Log-tree corruption possible — no abort on request, only warning"
+  info "If issues: sudo pacman -S linux-lts linux-lts-headers && sudo mkinitcpio -P && reboot into LTS"
+fi
+log "Kernel $(uname -r) ok"
+if curl --fail --silent --show-error --connect-timeout 10 --head https://archlinux.org/ >/dev/null 2>&1 || ping -c1 -W3 archlinux.org &>/dev/null; then
+  log "Internet reachable"
+else
+  fail "No internet connection – aborting to avoid incomplete setup."
+  exit 1
+fi
+info "Configure pacman (parallel, color, verbose)"
+if grep -q "^#\?ParallelDownloads" /etc/pacman.conf; then sudo sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' /etc/pacman.conf 2>/dev/null || true; else echo "ParallelDownloads = 5" | sudo tee -a /etc/pacman.conf >/dev/null; fi
+if grep -q "^#\?Color" /etc/pacman.conf; then sudo sed -i 's/^#\?Color/Color/' /etc/pacman.conf 2>/dev/null || true; else echo "Color" | sudo tee -a /etc/pacman.conf >/dev/null; fi
+if grep -q "^#\?VerbosePkgLists" /etc/pacman.conf; then sudo sed -i 's/^#\?VerbosePkgLists/VerbosePkgLists/' /etc/pacman.conf 2>/dev/null || true; else echo "VerbosePkgLists" | sudo tee -a /etc/pacman.conf >/dev/null; fi
+grep -q "ILoveCandy" /etc/pacman.conf || echo "ILoveCandy" | sudo tee -a /etc/pacman.conf >/dev/null
+info "Keyring fix (libcui18n error after fresh ISO)"
+sudo pacman -Sy --noconfirm archlinux-keyring cachyos-keyring 2>/dev/null || true
+sudo pacman-key --populate archlinux cachyos 2>/dev/null || true  # --init weggelassen (friert sonst bei wenig Entropie)
+if command -v cachyos-rate-mirrors &>/dev/null; then sudo cachyos-rate-mirrors 2>/dev/null || true; fi
+sudo chmod 644 /etc/pacman.d/mirrorlist /etc/pacman.d/cachyos-mirrorlist 2>/dev/null || true
+log "Pre-flight done"
+
+# ---------- 1. UPDATE ----------
+# Auf Arch/CachyOS muss das vollständige Update vor Installationen/Entfernungen laufen.
+step "1/8 SYSTEM UPDATE - full update, abort safely on error"
+if sudo pacman -Syu --noconfirm; then
+  log "System update done"
+else
+  fail "System update failed – no automatic --overwrite='*'. Check $ERROR_LOG and rerun after fixing."
+  exit 1
+fi
+
+# ---------- 1.5 BEREINIGUNG - bewusst ersetzte Apps und Kernel ----------
+step "1.5/8 CLEANUP - standard+Bore, remove replaced apps"
+info "Kernel: install standard + Bore from CachyOS repos; remove other kernels only without force"
+sudo pacman -S --needed --noconfirm linux-cachyos linux-cachyos-headers 2>/dev/null || warn "Standard-Kernel konnte nicht bestätigt werden"
+sudo pacman -S --needed --noconfirm linux-cachyos-bore linux-cachyos-bore-headers 2>/dev/null || warn "Bore-Kernel konnte nicht bestätigt werden"
+# AUR-Helper erst danach für die ausgewählten AUR-Anwendungen bereitstellen – nie zum Bauen des CachyOS-Kernels.
+# CachyOS bringt teils 'shelly' als nativen Manager mit – erkennen, aber Install-Flags bleiben bei paru/yay kompatibel
+if command -v shelly &>/dev/null; then
+  info "CachyOS shelly gefunden — nutze paru/yay Syntax für Kompatibilität"
+  if command -v paru &>/dev/null; then AUR="paru"
+  elif command -v yay &>/dev/null; then AUR="yay"
+  else
+    info "shelly allein vorhanden — installiere kompatiblen Helper (yay) für -S --needed Flags"
+    if sudo pacman -S --needed --noconfirm yay 2>/dev/null; then AUR="yay"
+    else
+      rm -rf /tmp/paru
+      git clone https://aur.archlinux.org/paru.git /tmp/paru 2>/dev/null
+      (cd /tmp/paru && makepkg -si --noconfirm 2>/dev/null) || warn "paru konnte nicht installiert werden"
+      AUR="paru"
+    fi
+  fi
+elif command -v paru &>/dev/null; then
+  AUR="paru"
+elif command -v yay &>/dev/null; then
+  AUR="yay"
+else
+  info "Kein AUR-Helper gefunden — versuche yay via pacman (weniger fehleranfällig als git clone)"
+  if sudo pacman -S --needed --noconfirm yay 2>/dev/null; then
+    AUR="yay"
+  else
+    rm -rf /tmp/paru
+    git clone https://aur.archlinux.org/paru.git /tmp/paru 2>/dev/null
+    (cd /tmp/paru && makepkg -si --noconfirm 2>/dev/null) || warn "paru konnte nicht installiert werden"
+    AUR="paru"
+  fi
+fi
+
+# Stelle sicher dass paru zusätzlich zu yay vorhanden ist (beide behalten)
+if command -v yay &>/dev/null && ! command -v paru &>/dev/null; then
+  sudo pacman -S --needed --noconfirm paru 2>/dev/null || true
+  command -v paru &>/dev/null && AUR="paru" || AUR="yay"
+fi
+
+# Den aktuell laufenden Kernel niemals entfernen. Kein -Rdd: Abhängigkeitskonflikte bleiben sichtbar.
+RUNNING_KERNEL_PKG="$(pacman -Qqo "/usr/lib/modules/$(uname -r)" 2>/dev/null | head -n1 || true)"
+mapfile -t KERNEL_PACKAGES < <(pacman -Qq 2>/dev/null | grep -E '^linux-(cachyos|zen|lts|hardened|rt|xanmod)(-|$)' || true)
+for k in "${KERNEL_PACKAGES[@]}"; do
+  case "$k" in
+    linux-cachyos|linux-cachyos-headers|linux-cachyos-bore|linux-cachyos-bore-headers) continue ;;
+  esac
+  if [[ -n "$RUNNING_KERNEL_PKG" && "$k" == "$RUNNING_KERNEL_PKG" ]]; then
+    warn "Lasse aktuell laufenden Kernel installiert: $k"
+  elif sudo pacman -Rns --noconfirm "$k" 2>/dev/null; then
+    log "Nicht benötigten Kernel entfernt: $k"
+  else
+    warn "Kernel $k nicht entfernt (Abhängigkeit oder Schutz) – kein Force-Remove"
+  fi
+done
+log "Kernel-Cleanup fertig: Standard+Bore bleiben, kein pacman -Rdd"
+
+info "Remove selected preinstalled apps – only with normal dependency check"
+# Bewusste Auswahl: Mission Center ist der Taskmanager; kein extra Alias für plasma-systemmonitor nötig.
+# knetattach ist ein separater Netzwerkordner-Assistent, keine KDE-Connect-Abhängigkeit; KDE Connect wird unten unabhängig installiert.
+REMOVED_PACKAGES=(
+  snapper cachyos-snapper-support limine-snapper-sync snap-pac snap-pac-grub btrfs-assistant
+  yakuake spectacle kmail kontact akonadi akregator korganizer
+  elisa dragon haruna amarok juk discover octopi flatseal btop neofetch
+  htop ksysguard plasma-systemmonitor khelpcenter konqueror kmahjongg kpat knetattach
+)
+for pkg in "${REMOVED_PACKAGES[@]}"; do
+  if pacman -Qq "$pkg" &>/dev/null; then
+    sudo pacman -Rns --noconfirm "$pkg" 2>/dev/null || warn "Behalte $pkg (wird noch benötigt)"
+  fi
+done
+# Flatpak-Varianten der bewusst ersetzten Apps entfernen.
+flatpak uninstall -y org.mozilla.firefox org.kde.kate 2>/dev/null || true
+# Snapper auf Wunsch komplett entfernen (Report zeigte aktiv, aber du willst paccache only)
+sudo systemctl disable --now snapper-cleanup.timer snapper-timeline.timer limine-snapper-sync.service 2>/dev/null || true
+sudo pacman -Rns --noconfirm snapper cachyos-snapper-support limine-snapper-sync 2>/dev/null || true
+log "Selected applications handled – no force removes"
+
+# Paketdateien nicht manuell aus /usr/share/locale löschen: Ein Update ist kein Reparatur-Mechanismus.
+# Fehlende Locale-Dateien bleiben bis zum jeweiligen Paket-Update kaputt und erzeugen einen inkonsistenten Paketbestand.
+info "Language packs stay package-managed (de+en fully available)"
+
+info "Clean fonts: keep only Nerd Fonts + Noto"
+sudo pacman -Rns --noconfirm gnu-free-fonts 2>/dev/null || true
+log "Fonts cleaned"
+
+info "Services: disable Baloo, Tracker, ModemManager and unnecessary services"
+balooctl disable 2>/dev/null || true; balooctl6 disable 2>/dev/null || true; balooctl purge 2>/dev/null || true; balooctl6 purge 2>/dev/null || true; balooctl suspend 2>/dev/null || true; systemctl --user mask baloo_file.service 2>/dev/null || true; kwriteconfig5 --file baloofilerc --group "Basic Settings" --key "Indexing-Enabled" false 2>/dev/null || true
+systemctl --user mask tracker-miner-fs.service tracker-miner-rss.service tracker-extract.service 2>/dev/null || true
+systemctl --user mask tracker-miner-fs-3.service tracker-extract-3.service 2>/dev/null || true
+sudo systemctl disable --now ModemManager 2>/dev/null || true
+sudo systemctl disable --now lvm2-monitor 2>/dev/null || true
+# KDE Connect ist bewusst ausgewählt und wird später installiert; keine wirkungslose oder widersprüchliche Service-Schleife.
+log "Unneeded services handled; KDE Connect kept"
+
+# ---------- 2. BASIS ----------
+step "2/8 BASE - Multilib, Flatpak"
+if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
+  printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' | sudo tee -a /etc/pacman.conf >/dev/null
+  # Neue Repository-Konfiguration immer mit einem vollständigen Update übernehmen, nie nur -Sy.
+  if ! sudo pacman -Syu --noconfirm; then
+    fail "Update nach Aktivierung von multilib fehlgeschlagen – Abbruch."
+    exit 1
+  fi
+fi
+sudo pacman -S --needed --noconfirm base-devel git flatpak pacman-contrib acl python pciutils 2>/dev/null || true
+sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+# Sichere Komfort-Befehle: keine Paketlöschung oder BleachBit-Aktion ohne Prüfung.
+mkdir -p "$HOME/.local/bin" "$HOME/.config/fish/conf.d"
+cat <<'EOF' > "$HOME/.local/bin/update-arch"
+#!/usr/bin/env bash
+set -u
+if ! sudo pacman -Syu --noconfirm; then
+  printf '%s\n' 'Pacman-Update fehlgeschlagen – kein AUR-/Flatpak-Folgeupdate gestartet.' >&2
+  exit 1
+fi
+flatpak update -y || true
+# ALLES updaten: System + Flatpak + AUR + BOOTLOADER + TREIBER beim ersten Lauf — wirklich ALLES
+sudo pacman -Syyu --noconfirm 2>/dev/null || sudo pacman -Syu --noconfirm || true
+# Bootloader + Firmware + Treiber explizit auf neuesten Stand (pacman -Syu macht es, hier nochmal explizit für Sicherheit)
+sudo pacman -S --needed --noconfirm limine mkinitcpio linux-firmware 2>/dev/null || true
+# Automatische GPU-Treiber Erkennung: nur den passenden Treiber installieren
+if lspci 2>/dev/null | grep -qi "nvidia"; then
+  sudo pacman -S --needed --noconfirm linux-firmware-nvidia nvidia nvidia-utils lib32-nvidia-utils nvidia-settings opencl-nvidia lib32-opencl-nvidia libva-nvidia-driver 2>/dev/null || sudo pacman -S --needed --noconfirm nvidia-open-dkms 2>/dev/null || true
+  command -v dkms >/dev/null 2>&1 && sudo dkms autoinstall 2>/dev/null || true
+elif lspci 2>/dev/null | grep -qiE "amd.*vga|amd.*graphics|Radeon"; then
+  sudo pacman -S --needed --noconfirm xf86-video-amdgpu vulkan-radeon lib32-vulkan-radeon 2>/dev/null || true
+elif lspci 2>/dev/null | grep -qi "intel.*graphics"; then
+  sudo pacman -S --needed --noconfirm xf86-video-intel vulkan-intel lib32-vulkan-intel 2>/dev/null || true
+fi
+sudo pacman -S --needed --noconfirm mesa lib32-mesa vulkan-icd-loader lib32-vulkan-icd-loader 2>/dev/null || true
+flatpak update -y 2>/dev/null || true
+flatpak repair 2>/dev/null || true
+# Initramfs + Bootloader neu bauen damit neue Treiber/Kernel sofort greifen
+sudo mkinitcpio -P 2>/dev/null || true
+if command -v limine-mkinitcpio >/dev/null 2>&1; then sudo limine-mkinitcpio 2>/dev/null || true; fi
+if command -v fwupdmgr >/dev/null 2>&1; then sudo fwupdmgr refresh 2>/dev/null || true; fi
+# UFW: only configure if installed, open ports before enabling (avoids self-block)
+if command -v ufw >/dev/null 2>&1; then
+  sudo ufw default deny incoming 2>/dev/null || true
+  sudo ufw default allow outgoing 2>/dev/null || true
+  sudo ufw allow 22000/tcp 2>/dev/null || true
+  sudo ufw allow 21027/udp 2>/dev/null || true
+  sudo ufw allow 1714:1764/tcp 2>/dev/null || true
+  sudo ufw allow 1714:1764/udp 2>/dev/null || true
+  sudo ufw allow 5353/udp 2>/dev/null || true
+  sudo ufw allow 5355/tcp 2>/dev/null || true
+  sudo ufw allow 5355/udp 2>/dev/null || true
+  sudo ufw allow 7680/tcp 2>/dev/null || true
+  sudo ufw allow 1900/udp 2>/dev/null || true
+  # Enable only if not already active, and only after rules
+  sudo ufw --force enable 2>/dev/null || true
+  log "UFW configured safely with Syncthing/KDE Connect/mDNS/LAN ports open"
+fi
+if command -v paru >/dev/null 2>&1; then
+  paru -Syu --noconfirm
+elif command -v yay >/dev/null 2>&1; then
+  yay -Syu --noconfirm
+else
+  printf '%s\n' 'Kein AUR-Helper gefunden – AUR-Updates übersprungen.'
+fi
+EOF
+cat <<'EOF' > "$HOME/.local/bin/clean-arch"
+#!/usr/bin/env bash
+set -u
+sudo paccache -rk2
+flatpak uninstall --unused -y || true
+sudo journalctl --vacuum-time=3d || true
+sudo journalctl --vacuum-size=100M || true
+orphans="$(pacman -Qdtq 2>/dev/null || true)"
+if [[ -n "$orphans" ]]; then
+  printf '%s\n%s\n' 'Mögliche Waisen – nur anzeigen, nicht automatisch entfernen:' "$orphans"
+  printf '%s\n' 'Nach Prüfung optional: sudo pacman -Rns <paketname>'
+else
+  printf '%s\n' 'Keine Pacman-Waisen gefunden.'
+fi
+printf '%s\n' 'BleachBit wird nicht automatisch ausgeführt. Erst: bleachbit --preview <cleaner>'
+EOF
+cat <<'EOF' > "$HOME/.local/bin/fix-key"
+#!/usr/bin/env bash
+set -u
+if ! sudo pacman -Syu --needed --noconfirm archlinux-keyring cachyos-keyring; then
+  printf '%s\n' 'Keyring-Update fehlgeschlagen.' >&2
+  exit 1
+fi
+sudo pacman-key --populate archlinux cachyos
+EOF
+cat <<'EOF' > "$HOME/.local/bin/update-mirrors"
+#!/usr/bin/env bash
+set -u
+if command -v cachyos-rate-mirrors >/dev/null 2>&1; then
+  sudo cachyos-rate-mirrors
+elif command -v reflector >/dev/null 2>&1; then
+  sudo reflector --latest 20 --sort rate --save /etc/pacman.d/mirrorlist
+else
+  printf '%s\n' 'Kein Mirror-Tool installiert (cachyos-rate-mirrors / reflector).'
+fi
+EOF
+cat <<'EOF' > "$HOME/.local/bin/configure-spicetify"
+#!/usr/bin/env bash
+# Konfiguriert Spicetify für das Spotify-Flatpak mit minimalen, gezielten Rechten.
+set -u
+SPOTIFY_APP_ID="com.spotify.Client"
+if ! command -v spicetify >/dev/null 2>&1; then
+  printf '%s\n' 'Spicetify ist nicht installiert.' >&2
+  exit 1
+fi
+if ! flatpak info "$SPOTIFY_APP_ID" >/dev/null 2>&1; then
+  printf '%s\n' 'Spotify Flatpak ist nicht installiert.' >&2
+  exit 1
+fi
+spotify_root="$(flatpak info --show-location "$SPOTIFY_APP_ID" 2>/dev/null || true)"
+spotify_path=""
+for candidate in "$spotify_root/files/extra/share/spotify" "$spotify_root/files/share/spotify"; do
+  if [[ -d "$candidate" ]]; then
+    spotify_path="$candidate"
+    break
+  fi
+done
+if [[ -z "$spotify_path" ]]; then
+  printf '%s\n' 'Spotify-Ressourcen wurden nicht gefunden; prüfe: flatpak info --show-location com.spotify.Client' >&2
+  exit 1
+fi
+prefs_path=""
+for candidate in \
+  "$HOME/.var/app/com.spotify.Client/config/spotify/prefs" \
+  "$HOME/.config/spotify/prefs"; do
+  if [[ -f "$candidate" ]]; then
+    prefs_path="$candidate"
+    break
+  fi
+done
+if [[ -z "$prefs_path" ]]; then
+  printf '%s\n' 'Starte Spotify einmal, melde dich an, schließe es und führe danach configure-spicetify erneut aus.' >&2
+  exit 2
+fi
+# Keine --filesystem=host-os Freigabe: nur die konkreten Spotify-Ressourcen werden beschreibbar gemacht.
+if [[ "$spotify_root" == /var/lib/flatpak/* ]]; then
+  if ! command -v setfacl >/dev/null 2>&1; then
+    printf '%s\n' 'setfacl fehlt; installiere zuerst das Paket acl.' >&2
+    exit 1
+  fi
+  sudo setfacl -m "u:$(id -un):rwx" "$spotify_path" || exit 1
+  sudo setfacl -R -m "u:$(id -un):rwX" "$spotify_path/Apps" || exit 1
+else
+  chmod u+rwX "$spotify_path" || exit 1
+  chmod -R u+rwX "$spotify_path/Apps" || exit 1
+fi
+if ! spicetify config spotify_path "$spotify_path" || ! spicetify config prefs_path "$prefs_path"; then
+  printf '%s\n' 'Spicetify-Pfade konnten nicht gespeichert werden.' >&2
+  exit 1
+fi
+# Marketplace/CustomApps brauchen nur Lesezugriff auf die gezielten Spicetify-Ordner, nie host-os.
+spicetify_config_file="$(spicetify -c 2>/dev/null || true)"
+if [[ -z "$spicetify_config_file" || ! -f "$spicetify_config_file" ]]; then
+  printf '%s\n' 'Spicetify-Konfigurationsdatei wurde nicht gefunden.' >&2
+  exit 1
+fi
+spicetify_config_dir="$(dirname "$spicetify_config_file")"
+for folder in CustomApps Extensions; do
+  mkdir -p "$spicetify_config_dir/$folder"
+  flatpak override --user --filesystem="$spicetify_config_dir/$folder:ro" "$SPOTIFY_APP_ID" || {
+    printf 'Flatpak-Freigabe für %s konnte nicht gesetzt werden.\n' "$folder" >&2
+    exit 1
+  }
+done
+if ! spicetify backup apply; then
+  printf '%s\n' 'Spicetify konnte nicht angewendet werden.' >&2
+  exit 1
+fi
+printf '%s\n' 'Spicetify wurde für Spotify eingerichtet. Nach einem Spotify-Update bei Bedarf erneut ausführen.'
+EOF
+cat <<'EOF' > "$HOME/.local/bin/clean-flatpak-caches"
+#!/usr/bin/env bash
+# Entfernt ausschließlich Inhalte aus den standardisierten Flatpak-XDG-Cache-Ordnern.
+# Ohne --yes wird nur die belegte Größe angezeigt.
+set -Euo pipefail
+cache_root="$HOME/.var/app"
+declare -a cache_dirs=()
+if [[ -d "$cache_root" && ! -L "$cache_root" ]]; then
+  while IFS= read -r -d '' cache_dir; do
+    cache_dirs+=("$cache_dir")
+  done < <(find "$cache_root" -mindepth 2 -maxdepth 2 -type d -name cache -print0 2>/dev/null)
+fi
+if (( ${#cache_dirs[@]} == 0 )); then
+  printf '%s\n' 'Keine Flatpak-App-Caches gefunden.'
+  exit 0
+fi
+printf '%s\n' 'Gefundene Flatpak-App-Caches (config/ und data/ bleiben unangetastet):'
+printf '  %q\n' "${cache_dirs[@]}"
+du -sch -- "${cache_dirs[@]}" 2>/dev/null || true
+if [[ "${1:-}" != "--yes" || $# -ne 1 ]]; then
+  printf '%s\n' 'Vorschau beendet. Zum gezielten Leeren ausführen: clean-flatpak-caches --yes'
+  exit 0
+fi
+for cache_dir in "${cache_dirs[@]}"; do
+  find "$cache_dir" -mindepth 1 -xdev -depth -delete
+done
+printf '%s\n' 'Flatpak-App-Caches geleert. Einstellungen und Nutzerdaten wurden nicht gelöscht.'
+EOF
+cat <<'EOF' > "$HOME/.local/bin/clean-wine-temp"
+#!/usr/bin/env bash
+# Leert nur Temp-Inhalte eines explizit angegebenen Wine-/Proton-Prefixes; nie Shadercache oder den Prefix selbst.
+set -Euo pipefail
+if [[ $# -ne 2 || "$1" != "--yes" ]]; then
+  printf '%s\n' 'Verwendung: clean-wine-temp --yes /absoluter/pfad/zum/prefix' >&2
+  printf '%s\n' 'Beispiel Steam: clean-wine-temp --yes ~/.local/share/Steam/steamapps/compatdata/APPID/pfx' >&2
+  exit 2
+fi
+prefix="$(realpath -e -- "$2" 2>/dev/null || true)"
+if [[ -z "$prefix" || ! -f "$prefix/system.reg" || ! -d "$prefix/drive_c/users" ]]; then
+  printf '%s\n' 'Kein gültiger Wine-/Proton-Prefix (system.reg und drive_c/users erforderlich).' >&2
+  exit 2
+fi
+for process in wineserver wine wine64 wine-preloader wine64-preloader steam steamwebhelper lutris bottles; do
+  if pgrep -u "$(id -u)" -x "$process" >/dev/null 2>&1; then
+    printf 'Abbruch: %s läuft noch. Schließe Steam, Wine, Lutris und Bottles zuerst.\n' "$process" >&2
+    exit 1
+  fi
+done
+declare -a temp_dirs=()
+while IFS= read -r -d '' temp_dir; do
+  temp_dirs+=("$temp_dir")
+done < <(find "$prefix/drive_c/users" -xdev -type d -path '*/AppData/Local/Temp' -print0 2>/dev/null)
+if (( ${#temp_dirs[@]} == 0 )); then
+  printf '%s\n' 'Keine Windows-Temp-Ordner in diesem Prefix gefunden.'
+  exit 0
+fi
+printf '%s\n' 'Folgende Temp-Ordner werden geleert (nur deren Inhalte; Prefix und Shadercache bleiben außerhalb davon):'
+printf '  %q\n' "${temp_dirs[@]}"
+du -sch -- "${temp_dirs[@]}" 2>/dev/null || true
+for temp_dir in "${temp_dirs[@]}"; do
+  find "$temp_dir" -mindepth 1 -xdev -depth -delete
+done
+printf '%s\n' 'Windows-Temp-Inhalte dieses Prefixes wurden geleert.'
+EOF
+chmod +x "$HOME/.local/bin/update-arch" "$HOME/.local/bin/clean-arch" "$HOME/.local/bin/fix-key" "$HOME/.local/bin/update-mirrors" "$HOME/.local/bin/configure-spicetify" "$HOME/.local/bin/clean-flatpak-caches" "$HOME/.local/bin/clean-wine-temp"
+# Den neuen Pfad sofort im aktuellen Skriptprozess verfügbar machen und dauerhaft für Bash/Fish speichern.
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# ~/.local/bin für Bash und Fish dauerhaft verfügbar machen, ohne Bash-Syntax in Fish zu schreiben.
+if ! grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CachyOS local tools' "$HOME/.bashrc" 2>/dev/null; then
+  printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH" # CachyOS local tools' >> "$HOME/.bashrc"
+fi
+cat <<'EOF' > "$HOME/.config/fish/conf.d/cachyos-local-tools.fish"
+if not contains -- "$HOME/.local/bin" $PATH
+    set -gx PATH "$HOME/.local/bin" $PATH
+end
+EOF
+log "Base+helper commands: update-arch, clean-arch, fix-key, update-mirrors, configure-spicetify, clean-flatpak-caches, clean-wine-temp"
+
+# UFW Firewall für Gaming/Sync sofort korrekt konfigurieren (nicht erst beim nächsten update-arch)
+if command -v ufw >/dev/null 2>&1; then
+  sudo ufw default deny incoming 2>/dev/null || true
+  sudo ufw default allow outgoing 2>/dev/null || true
+  sudo ufw allow 22000/tcp 2>/dev/null || true
+  sudo ufw allow 21027/udp 2>/dev/null || true
+  sudo ufw allow 1714:1764/tcp 2>/dev/null || true
+  sudo ufw allow 1714:1764/udp 2>/dev/null || true
+  sudo ufw allow 5353/udp 2>/dev/null || true
+  sudo ufw allow 5355/tcp 2>/dev/null || true
+  sudo ufw allow 5355/udp 2>/dev/null || true
+  sudo ufw allow 7680/tcp 2>/dev/null || true
+  sudo ufw allow 1900/udp 2>/dev/null || true
+  sudo ufw --force enable 2>/dev/null || true
+  log "Firewall (UFW) configured with Syncthing/KDE Connect/mDNS/LAN ports"
+fi
+
+# ---------- 3. AUSGEWÄHLTE ANWENDUNGEN ----------
+step "3/8 APPLICATIONS - install selected programs"
+
+info "Browser: configure Brave (remove Firefox – report showed Firefox still active)"
+pkill firefox 2>/dev/null || true
+sudo pacman -Rns --noconfirm firefox firefox-i18n-de 2>/dev/null || true; flatpak uninstall -y org.mozilla.firefox 2>/dev/null || true
+sudo pacman -S --needed --noconfirm brave-browser 2>/dev/null || $AUR -S --needed --noconfirm brave-bin 2>/dev/null || true
+sudo mkdir -p /etc/brave/policies/managed
+sudo tee /etc/brave/policies/managed/brave-settings.json >/dev/null <<'EOF'
+{
+  "BraveRewardsDisabled": true,
+  "BraveWalletDisabled": true,
+  "BraveVPNDisabled": true,
+  "BraveNewsDisabled": true,
+  "BraveAIChatEnabled": false,
+  "BraveTalkDisabled": true
+}
+EOF
+sudo tee /etc/brave/policies/managed/extensions.json >/dev/null <<'EOF'
+{"ExtensionInstallForcelist":["eimadpbcbfnmbkopoojfekhnkhdbieeh;https://clients2.google.com/service/update2/crx","mnjggcdmjocbbbhaepdhchncahnbgone;https://clients2.google.com/service/update2/crx","gebbhagfogifgggkldgodflihgfeippi;https://clients2.google.com/service/update2/crx","cjpalhdlnbpafiamejdnhcphjbkeiagm;https://clients2.google.com/service/update2/crx","hdokiejnpimakedhajhdlcegeplioahd;https://clients2.google.com/service/update2/crx","ponfpcnoehjfmfllpaingbgckeeldkh;https://clients2.google.com/service/update2/crx","alhmbbnlcggfcjjfihglopfopcbigmil;https://clients2.google.com/service/update2/crx"]}
+EOF
+
+# WhatsApp PWA wird manuell installiert — kein force-install mehr (auf Wunsch)
+info "Terminal: Alacritty + Konsole + Fish + Fisher+Z + Starship (keep both terminals)"
+# btop/neofetch/fastfetch wurden oben ausschließlich mit normaler Abhängigkeitsprüfung behandelt – nie mit -Rdd.
+sudo pacman -S --needed --noconfirm alacritty konsole fish starship 2>/dev/null || true
+log "Keep both terminals: Alacritty + Konsole"
+# Fisher erst als Funktionsdatei speichern; die frische Fish-Instanz lädt sie dann zuverlässig.
+if command -v fish &>/dev/null; then
+  mkdir -p "$HOME/.config/fish/functions"
+  if curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+      https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish \
+      -o "$HOME/.config/fish/functions/fisher.fish"; then
+    if fish -c 'fisher install jorgebucaran/fisher jethrokuan/z'; then
+      log "Fisher und z für Fish installiert"
+    else
+      warn "Fisher-Plugins konnten nicht installiert werden"
+    fi
+  else
+    warn "Fisher konnte nicht heruntergeladen werden"
+  fi
+else
+  warn "Fish ist nicht verfügbar – Fisher-Plugins übersprungen"
+fi
+# Kein Conky Widget mehr — stattdessen bester Taskmanager (Mission Center wie Windows)
+flatpak install -y flathub io.missioncenter.MissionCenter 2>/dev/null || sudo pacman -S --needed --noconfirm plasma-systemmonitor 2>/dev/null || true
+log "Taskmanager Mission Center installiert (Fallback plasma-systemmonitor)"
+sudo pacman -S --needed --noconfirm catfish 2>/dev/null || true
+mkdir -p ~/.config/fish; starship preset nerd-font-symbols -o ~/.config/starship.toml 2>/dev/null || true; grep -q "starship init fish" ~/.config/fish/config.fish 2>/dev/null || echo 'starship init fish | source' >> ~/.config/fish/config.fish
+
+info "Apps: Flameshot (Spectacle removed), Gimp+Gwenview, VLC+ffmpeg, Ark+p7zip/unrar/unzip/lrzip, LibreOffice, CopyQ + Kate"
+sudo pacman -Rns --noconfirm spectacle 2>/dev/null || true
+sudo pacman -S --needed --noconfirm flameshot gimp gwenview vlc vlc-plugins-all ffmpeg ark p7zip unrar unzip lrzip dolphin dolphin-plugins okular kate 2>/dev/null || true
+# Keine Windows-Aliase mehr — alle Aliase entfernt auf Wunsch (clean)
+# (früher hier: notepad->kate, snippingtool->flameshot, roblox->sober etc. — jetzt entfernt)
+sudo pacman -S --needed --noconfirm libreoffice-fresh libreoffice-fresh-de 2>/dev/null || $AUR -S --needed --noconfirm libreoffice-fresh 2>/dev/null || true
+sudo pacman -S --needed --noconfirm copyq bleachbit stacer fwupd openrgb lm_sensors 2>/dev/null || true
+$AUR -S --needed --noconfirm stacer-bin 2>/dev/null || flatpak install -y flathub io.github.stacer 2>/dev/null || true
+
+info "Comm: Discord/Vesktop skipped (public version without Vencord), WhatsApp as Brave App, Spotify+Spicetify, LastPass"
+# Public version: No Vencord/Vesktop and no MessageLogger (ToS-safe). For Discord: flatpak install flathub com.discordapp.Discord
+# Vesktop/Vencord removed in public version – no plugin setup
+# Public version: No Vencord/MessageLogger configuration
+# WhatsApp as Brave App (PWA) instead of Flatpak — so WAIncognito (browser addon) works 🟢📱
+flatpak install -y flathub com.spotify.Client 2>/dev/null || true
+# WhatsApp Web wird manuell eingerichtet — kein Auto-Install mehr (auf Wunsch)
+log "WhatsApp manually via brave://apps (if not working: brave --app=https://web.whatsapp.com)"
+if ! $AUR -S --needed --noconfirm spicetify-cli 2>/dev/null; then
+  warn "Spicetify konnte nicht installiert werden (ohne AdBlock, reines Theming)"
+fi
+mkdir -p ~/.config/spicetify
+info "Spicetify: Spotify once open/log in, close, then run configure-spicetify (no ad-blocking, theming only)"
+# Standard Mail Client fuer alle (statt Proton) – Thunderbird, bei Bedarf Proton separat: flatpak install flathub me.proton.Mail
+if ! flatpak install -y flathub org.mozilla.Thunderbird 2>/dev/null; then
+  sudo pacman -S --needed --noconfirm thunderbird 2>/dev/null || true
+fi
+# Proton Mail & VPN entfernt – bei Bedarf manuell: flatpak install flathub me.proton.Mail / com.protonvpn.www
+
+info "Sync/Remote: KDEConnect Syncthing RustDesk Sunshine WaydroidStore"
+sudo pacman -S --needed --noconfirm kdeconnect syncthing 2>/dev/null || true; systemctl --user enable --now syncthing 2>/dev/null || true
+$AUR -S --needed --noconfirm rustdesk-bin sunshine-bin 2>/dev/null || flatpak install -y flathub com.rustdesk.RustDesk 2>/dev/null || true
+
+info "Gaming: Steam, Heroic, Prism, Sober, BedrockOnLinux, Waydroid, QEMU, Bottles, Lutris and tools"
+sudo pacman -S --needed --noconfirm steam 2>/dev/null || true
+$AUR -S --needed --noconfirm heroic-games-launcher-bin 2>/dev/null || flatpak install -y flathub com.heroicgameslauncher.hgl 2>/dev/null || true
+sudo pacman -S --needed --noconfirm prism-launcher jdk8-openjdk jdk11-openjdk jdk17-openjdk jdk21-openjdk jdk-openjdk 2>/dev/null || $AUR -S --needed --noconfirm prism-launcher-bin 2>/dev/null || flatpak install -y flathub org.prismlauncher.PrismLauncher 2>/dev/null || true
+# Fallback: falls einzelne JDKs fehlen (ältere), einzeln versuchen
+for jdk in jdk8-openjdk jdk11-openjdk jdk17-openjdk jdk21-openjdk; do sudo pacman -S --needed --noconfirm $jdk 2>/dev/null || true; done
+flatpak install -y flathub org.vinegarhq.Sober 2>/dev/null || true
+# BedrockOnLinux lädt mit deinem Microsoft-Konto die Windows-/GDK-Ausgabe von Minecraft Bedrock.
+# Bewusst kein mcpelauncher-Fallback: mcpelauncher nutzt die Android-Ausgabe und wäre etwas anderes.
+if ! $AUR -S --needed --noconfirm bedrock-on-linux-bin 2>/dev/null; then
+  warn "BedrockOnLinux konnte nicht installiert werden – die Android-Version wird nicht ersatzweise installiert"
+fi
+if ! sudo pacman -S --needed --noconfirm waydroid lzip 2>/dev/null; then
+  $AUR -S --needed --noconfirm waydroid 2>/dev/null || warn "Waydroid konnte nicht installiert werden"
+fi
+# Binder nur dann beim Boot laden, wenn der aktuelle Kernel das Modul tatsächlich bereitstellt.
+if modinfo binder_linux &>/dev/null; then
+  sudo install -d -m 755 /etc/modules-load.d /etc/modprobe.d
+  printf '%s\n' 'binder_linux' | sudo tee /etc/modules-load.d/waydroid-binder.conf >/dev/null
+  if modinfo -F parm binder_linux 2>/dev/null | grep -q '^devices:'; then
+    printf '%s\n' 'options binder_linux devices=binder,hwbinder,vndbinder' | sudo tee /etc/modprobe.d/waydroid-binder.conf >/dev/null
+  fi
+  if sudo modprobe binder_linux; then
+    log "Waydroid Binder-Modul geladen und für den Boot vorgemerkt"
+  else
+    warn "binder_linux konnte nicht geladen werden – Waydroid-Log nach dem Start prüfen"
+  fi
+else
+  info "binder_linux ist kein ladbares Modul; keine erzwungene modules-load-Konfiguration erstellt"
+fi
+if ! $AUR -S --needed --noconfirm libhoudini 2>/dev/null; then
+  warn "libhoudini wurde nicht installiert – kein externes Root-Skript wird automatisch ausgeführt"
+fi
+sudo waydroid init -s GAPPS -f 2>/dev/null || warn "Waydroid-Initialisierung fehlgeschlagen"
+sudo systemctl enable --now waydroid-container 2>/dev/null || warn "waydroid-container konnte nicht gestartet werden"
+sudo pacman -S --needed --noconfirm qemu-full virt-manager virt-viewer libvirt edk2-ovmf 2>/dev/null || sudo pacman -S --needed --noconfirm qemu virt-manager libvirt 2>/dev/null || true
+sudo systemctl enable --now libvirtd 2>/dev/null || true; sudo usermod -aG libvirt,kvm,qemu $USER 2>/dev/null || true
+$AUR -S --needed --noconfirm protonup-qt steamtinkerlaunch umu-launcher 2>/dev/null || flatpak install -y flathub net.davidotek.pupgui2 2>/dev/null || true
+sudo pacman -S --needed --noconfirm bottles lutris winetricks protontricks mangohud lib32-mangohud vkbasalt lib32-vkbasalt gamescope gamemode lib32-gamemode obs-studio distrobox podman 2>/dev/null || $AUR -S --needed --noconfirm bottles lutris 2>/dev/null || flatpak install -y flathub com.usebottles.bottles 2>/dev/null || true
+$AUR -S --needed --noconfirm debtap alien 2>/dev/null || true
+command -v debtap &>/dev/null && sudo debtap -u >/dev/null 2>&1 &
+sudo pacman -S --needed --noconfirm git github-cli handbrake 2>/dev/null || true
+
+info "GUI/Theme: Bauh (Flatseal removed), Variety, Kvantum, keep Plymouth"
+$AUR -S --needed --noconfirm bauh 2>/dev/null || true
+$AUR -S --needed --noconfirm variety 2>/dev/null || true
+sudo pacman -S --needed --noconfirm kvantum plymouth 2>/dev/null || true; $AUR -S --needed --noconfirm plymouth-theme-cachyos 2>/dev/null || true; sudo plymouth-set-default-theme -R cachyos 2>/dev/null || true
+log "Selected applications installed"
+
+# ---------- 4. LEISTUNGS-TWEAKS ----------
+step "4/8 PERFORMANCE TWEAKS - apply desired gaming settings"
+# Der Bore-Kernel wurde bereits vor dem Kernel-Cleanup in Phase 1.5 installiert und dort geschützt.
+if pacman -Q linux-cachyos-bore &>/dev/null; then
+  log "Bore kernel already installed"
+else
+  warn "Bore kernel missing – check log before rebooting"
+fi
+# Automatic hardware detection for public GitHub script
+if lscpu 2>/dev/null | grep -qi "GenuineIntel"; then
+  sudo pacman -S --needed --noconfirm intel-ucode 2>/dev/null || true
+elif lscpu 2>/dev/null | grep -qi "AuthenticAMD"; then
+  sudo pacman -S --needed --noconfirm amd-ucode 2>/dev/null || true
+fi
+sudo pacman -S --needed --noconfirm zram-generator ananicy-cpp cachyos-ananicy-rules scx-scheds cpupower earlyoom 2>/dev/null || true
+sudo systemctl enable --now ananicy-cpp earlyoom 2>/dev/null || true
+# Hardware-dependent GPU drivers install directly (for GitHub users with different hardware)
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+  log "NVIDIA detected ($GPU_VENDOR) – installing NVIDIA drivers automatically"
+  sudo pacman -S --needed --noconfirm nvidia nvidia-utils lib32-nvidia-utils nvidia-settings opencl-nvidia lib32-opencl-nvidia libva-nvidia-driver 2>/dev/null || sudo pacman -S --needed --noconfirm nvidia-open-dkms 2>/dev/null || true
+elif [[ "$GPU_VENDOR" == "amd" ]]; then
+  log "AMD detected – installing AMD drivers automatically"
+  sudo pacman -S --needed --noconfirm xf86-video-amdgpu vulkan-radeon lib32-vulkan-radeon 2>/dev/null || true
+elif [[ "$GPU_VENDOR" == "intel" ]]; then
+  log "Intel detected – installing Intel drivers automatically"
+  sudo pacman -S --needed --noconfirm xf86-video-intel vulkan-intel lib32-vulkan-intel 2>/dev/null || true
+else
+  log "GPU unknown – installing generic Mesa drivers"
+fi
+# Ananicy CGroups Fix (Report: cpu controller not available) - Fallback auf nice only wenn cgroup fehlt
+if ! grep -q "cpu" /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then sudo mkdir -p /etc/ananicy.d; echo "apply_cgroup=false" | sudo tee -a /etc/ananicy.d/00-cgroup-fix.conf >/dev/null || true; fi
+
+# === AUTOMATISCHE DRUCKER ERKENNUNG – nur wenn Hardware vorhanden (hohe Qualitaet) ===
+# Base CUPS always available, but drivers only if printer is detected
+if lsusb 2>/dev/null | grep -qiE "printer|hewlett|hp|canon|epson|brother|lexmark|kyocera|ricoh|oki" || lpstat -p 2>/dev/null | grep -q printer || ls /dev/usb/lp* 2>/dev/null | grep -q lp; then
+  log "Printer detected – installing printer support automatically"
+  sudo pacman -S --needed --noconfirm cups cups-pdf cups-filters system-config-printer 2>/dev/null || true
+  sudo pacman -S --needed --noconfirm gutenprint foomatic-db foomatic-db-engine foomatic-db-nonfree 2>/dev/null || true
+  sudo pacman -S --needed --noconfirm ghostscript gsfonts 2>/dev/null || true
+  # Hersteller-spezifisch nur wenn passende Hardware gefunden
+  if lsusb 2>/dev/null | grep -qiE "hewlett|hp"; then sudo pacman -S --needed --noconfirm hplip 2>/dev/null || true; fi
+  if lsusb 2>/dev/null | grep -qi "epson"; then sudo pacman -S --needed --noconfirm epson-inkjet-printer-escpr 2>/dev/null || true; fi
+  if lsusb 2>/dev/null | grep -qi "canon"; then sudo pacman -S --needed --noconfirm cnijfilter2 2>/dev/null || true; fi
+  if lsusb 2>/dev/null | grep -qi "brother"; then sudo pacman -S --needed --noconfirm brlaser 2>/dev/null || true; fi
+  sudo systemctl enable --now cups.service cups.socket 2>/dev/null || true
+  sudo systemctl enable --now avahi-daemon 2>/dev/null || true
+else
+  log "No printer detected – printer support skipped (if needed: sudo pacman -S cups system-config-printer)"
+  # CUPS nicht automatisch starten wenn kein Drucker vorhanden – spart RAM
+fi
+
+# === AUTOMATISCHER SCANNER SUPPORT ===
+if lsusb 2>/dev/null | grep -qiE "scanner|hewlett|canon|epson|brother|fujitsu" || sane-find-scanner 2>/dev/null | grep -qi "found"; then
+  log "Scanner detected – installing scanner support"
+  sudo pacman -S --needed --noconfirm sane sane-airscan simple-scan 2>/dev/null || true
+  sudo pacman -S --needed --noconfirm sane-airscan 2>/dev/null || true
+fi
+
+# === AUTOMATISCHER BLUETOOTH SUPPORT ===
+if lsusb 2>/dev/null | grep -qi bluetooth || lspci 2>/dev/null | grep -qi bluetooth || rfkill list 2>/dev/null | grep -qi bluetooth || dmesg 2>/dev/null | grep -qi bluetooth; then
+  log "Bluetooth hardware detected – installing Bluetooth stack"
+  sudo pacman -S --needed --noconfirm bluez bluez-utils blueman 2>/dev/null || true
+  sudo systemctl enable --now bluetooth.service 2>/dev/null || true
+else
+  log "No Bluetooth detected – skipped"
+fi
+
+# === AUTOMATISCHER WLAN FIRMWARE ===
+if lspci 2>/dev/null | grep -qiE "network|wireless|wlan|wifi" || lsusb 2>/dev/null | grep -qiE "wireless|wlan|wifi|realtek.*802|mediatek.*wireless|intel.*wireless"; then
+  log "WLAN hardware detected – installing WLAN firmware"
+  sudo pacman -S --needed --noconfirm linux-firmware-whence linux-firmware 2>/dev/null || true
+  # Zusaetzliche Firmware fuer haeufige Chips
+  if lspci 2>/dev/null | grep -qi "realtek"; then sudo pacman -S --needed --noconfirm rtl88xxau-aircrack-dkms-firmware 2>/dev/null || true; fi
+fi
+
+# === AUTOMATISCHER SOUND FIRMWARE ===
+sudo pacman -S --needed --noconfirm sof-firmware alsa-firmware pipewire pipewire-pulse pipewire-alsa 2>/dev/null || true  # Headphones (wired + Bluetooth) work automatically via sound firmware + pipewire/bluez
+
+# === AUTOMATISCHER WEBCAM / FINGERPRINT (optional, nur wenn vorhanden) ===
+if lsusb 2>/dev/null | grep -qiE "webcam|camera|chicony|logitech.*camera"; then
+  log "Webcam erkannt – Treiber bereits im Kernel (uvcvideo)"
+fi
+if lsusb 2>/dev/null | grep -qiE "fingerprint|validity|synaptics.*fp"; then
+  log "Fingerprint Reader erkannt – installiere fprint"
+  sudo pacman -S --needed --noconfirm fprintd 2>/dev/null || true
+fi
+# CPU: use EPP on amd-pstate-epp (Ryzen 5600X etc.), don't force governor when EPP is available (avoids power-profiles-daemon error)
+if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference ]]; then
+  log "AMD EPP detected (amd-pstate-epp) – using EPP, leaving governor to system daemon"
+  # Enable boost safely
+  echo 1 | sudo tee /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
+  for p in /sys/devices/system/cpu/cpufreq/policy*/boost; do echo 1 | sudo tee "$p" 2>/dev/null || true; done
+  for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do echo balance_performance | sudo tee "$f" 2>/dev/null || echo power | sudo tee "$f" 2>/dev/null || true; done
+  log "AMD EPP set to balance_performance (Gamemode will boost to performance when needed)"
+else
+  # Fallback for systems without EPP: use schedutil
+  echo 'governor="schedutil"' | sudo tee /etc/default/cpupower >/dev/null; sudo systemctl enable --now cpupower 2>/dev/null || true
+  sudo cpupower frequency-set -g schedutil 2>/dev/null || sudo cpupower frequency-set -g powersave 2>/dev/null || true
+  for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo schedutil | sudo tee $f 2>/dev/null || echo powersave | sudo tee $f 2>/dev/null || true; done
+  log "CPU governor set to schedutil (no EPP available)"
+fi
+# Do not mask power-profiles-daemon when EPP is present – it manages EPP correctly
+cat <<'EOF' | sudo tee /etc/systemd/zram-generator.conf >/dev/null
+[zram0]
+zram-size = ram
+compression-algorithm = zstd
+swap-priority = 100
+EOF
+if [[ "$GAMING_EXTREME" == "true" ]]; then SPLIT="kernel.split_lock_mitigate=0"; else SPLIT="# split_lock nur EXTREME"; fi
+cat <<EOF | sudo tee /etc/sysctl.d/99-gaming-max.conf >/dev/null
+vm.max_map_count=2147483642
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+vm.dirty_ratio=10
+vm.dirty_background_ratio=5
+$SPLIT
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+fs.file-max=2097152
+vm.nr_hugepages=0
+EOF
+sudo sysctl --system 2>/dev/null || true; sudo sysctl -w vm.swappiness=10 2>/dev/null || true; echo 10 | sudo tee /proc/sys/vm/swappiness 2>/dev/null || true; sudo sysctl -w vm.vfs_cache_pressure=50 2>/dev/null || true
+# Watchdog etc. außerhalb von GAMING_EXTREME
+# Watchdog bleibt an (auf Wunsch nicht geblacklistet) — sicherer bei Freeze
+log "Watchdog stays active (no blacklist on request)"
+# Coredumps bleiben an (auf Wunsch nicht deaktiviert) — Debug Infos bei Crash verfügbar
+log "Coredumps stay active (no disable on request)"
+# Shader-Cache clean Helper — kein Limit, aber sauber löschbar 🧹🎮
+cat <<'EOF' > "$HOME/.local/bin/clean-shader-cache"
+#!/usr/bin/env bash
+set -uo pipefail
+echo "Shader-Caches die geleert werden:"
+du -sch -- "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/nvidia" "$HOME/.cache/radv_builtin_shaders" "$HOME/.nv" "$HOME/.cache/dxvk" 2>/dev/null || true
+if [[ "${1:-}" != "--yes" ]]; then echo "Vorschau — mit --yes wirklich löschen: clean-shader-cache --yes"; exit 0; fi
+rm -rf -- "$HOME/.cache/mesa_shader_cache" "$HOME/.cache/nvidia" "$HOME/.cache/radv_builtin_shaders" "$HOME/.nv" "$HOME/.cache/dxvk" 2>/dev/null || true
+echo "Shader-Caches geleert — beim nächsten Spielstart werden sie neu aufgebaut (kurz mehr Ruckler)"
+EOF
+chmod +x "$HOME/.local/bin/clean-shader-cache"
+log "Shader-Cache Helper erstellt: clean-shader-cache"
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+cat <<'EOF' | sudo tee /etc/tmpfiles.d/thp.conf >/dev/null
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise
+w /sys/kernel/mm/transparent_hugepage/defrag - - - - madvise
+EOF
+# amd_pstate wird nicht via modprobe.d gesetzt — Kernel-Default bleibt, EPP regelt Performance
+cat <<'EOF' | sudo tee /etc/security/limits.d/99-gaming.conf >/dev/null
+@users soft nice -20
+@users hard nice -20
+* soft memlock unlimited
+* hard memlock unlimited
+EOF
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+sudo mkdir -p /etc/X11/xorg.conf.d; cat <<'EOF' | sudo tee /etc/X11/xorg.conf.d/20-nvidia.conf >/dev/null
+Section "Device"
+    Identifier "NVIDIA Card"
+    Driver "nvidia"
+    Option "TripleBuffer" "off"
+    Option "Coolbits" "28"
+EndSection
+EOF
+fi # nur bei NVIDIA
+mkdir -p ~/.config/gamemode; echo -e "[general]\nrenice=10\ndesiredgov=performance" > ~/.config/gamemode/gamemode.ini
+# Mitigations OFF nur im EXTREME Gaming-Modus (bewusster Trade-off)
+if [[ "$GAMING_EXTREME" == "true" ]]; then
+# Mitigations OFF wie gewünscht – aber nur in der Konfiguration des tatsächlich erkannten Bootloaders.
+# CachyOS nutzt je nach Installation Limine, systemd-boot, GRUB oder rEFInd; jede Variante hat eine andere Quelle.
+BOOTLOADER="unknown"
+BOOTLOADER_CONFIG=""
+if [[ -f /etc/default/limine ]]; then
+  BOOTLOADER="limine"
+  BOOTLOADER_CONFIG="/etc/default/limine"
+  if sudo grep -qE '^[[:space:]]*KERNEL_CMDLINE\[.*\]=' "$BOOTLOADER_CONFIG"; then
+    sudo sed -Ei '/^[[:space:]]*KERNEL_CMDLINE\[.*\]=/ { s/[[:space:]]*mitigations=off//g; s/"$/ mitigations=off"/; }' "$BOOTLOADER_CONFIG" || warn "Limine-Konfiguration konnte nicht geändert werden"
+  else
+    echo 'KERNEL_CMDLINE[default]+=" mitigations=off"' | sudo tee -a "$BOOTLOADER_CONFIG" >/dev/null
+  fi
+elif [[ -f /etc/sdboot-manage.conf ]]; then
+  BOOTLOADER="systemd-boot"
+  BOOTLOADER_CONFIG="/etc/sdboot-manage.conf"
+  if sudo grep -qE '^[[:space:]]*LINUX_OPTIONS=' "$BOOTLOADER_CONFIG"; then
+    sudo sed -Ei '/^[[:space:]]*LINUX_OPTIONS=/ { s/[[:space:]]*mitigations=off//g; s/"$/ mitigations=off"/; }' "$BOOTLOADER_CONFIG" || warn "systemd-boot-Konfiguration konnte nicht geändert werden"
+  else
+    echo 'LINUX_OPTIONS="mitigations=off"' | sudo tee -a "$BOOTLOADER_CONFIG" >/dev/null
+  fi
+elif [[ -f /etc/default/grub ]]; then
+  BOOTLOADER="grub"
+  BOOTLOADER_CONFIG="/etc/default/grub"
+  if sudo grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' "$BOOTLOADER_CONFIG"; then
+    sudo sed -Ei '/^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=/ { s/[[:space:]]*mitigations=off//g; s/"$/ mitigations=off"/; }' "$BOOTLOADER_CONFIG" || warn "GRUB-Konfiguration konnte nicht geändert werden"
+  else
+    echo 'GRUB_CMDLINE_LINUX_DEFAULT="mitigations=off"' | sudo tee -a "$BOOTLOADER_CONFIG" >/dev/null
+  fi
+elif [[ -f /boot/refind_linux.conf ]]; then
+  BOOTLOADER="refind"
+  BOOTLOADER_CONFIG="/boot/refind_linux.conf"
+  if sudo grep -qE '^[[:space:]]*"Boot using default options"' "$BOOTLOADER_CONFIG"; then
+    sudo sed -Ei '/^[[:space:]]*"Boot using default options"/ { s/[[:space:]]*mitigations=off//g; s/"$/ mitigations=off"/; }' "$BOOTLOADER_CONFIG" || warn "rEFInd-Konfiguration konnte nicht geändert werden"
+  else
+    warn "rEFInd-Standardzeile nicht gefunden – schreibe keine unvollständige Bootoption"
+  fi
+elif [[ -f /etc/kernel/cmdline ]]; then
+  # Generischer kernel-install-Fallback – nur verwenden, wenn die Datei bereits Teil des Setups ist.
+  BOOTLOADER="kernel-install"
+  BOOTLOADER_CONFIG="/etc/kernel/cmdline"
+  if ! sudo grep -qw 'mitigations=off' "$BOOTLOADER_CONFIG"; then
+    echo 'mitigations=off' | sudo tee -a "$BOOTLOADER_CONFIG" >/dev/null
+  fi
+else
+  warn "Kein unterstützter Bootloader erkannt – mitigations=off wurde nicht blind geschrieben"
+fi
+log "Bootloader erkannt: $BOOTLOADER${BOOTLOADER_CONFIG:+ ($BOOTLOADER_CONFIG)}"
+# Safety-Net: systemd-boot liest auch /etc/kernel/cmdline (kernel-install)
+if [[ "$BOOTLOADER" == "systemd-boot" && -d /etc/kernel ]]; then
+  sudo mkdir -p /etc/kernel
+  for param in mitigations=off; do sudo grep -qw "$param" /etc/kernel/cmdline 2>/dev/null || echo "$param" | sudo tee -a /etc/kernel/cmdline >/dev/null; done
+  # Watchdog auf Wunsch AN -> nowatchdog explizit entfernen falls vorhanden
+  sudo sed -Ei 's/[[:space:]]*nowatchdog//g' /etc/kernel/cmdline 2>/dev/null || true
+  sudo sed -Ei 's/[[:space:]]*nowatchdog//g' "$BOOTLOADER_CONFIG" 2>/dev/null || true
+fi
+else
+  log "Mitigations bleiben an (SAFE/GAMING) — kein mitigations=off"
+fi
+# Watchdog auf Wunsch AN -> nowatchdog wird nicht ergänzt, sondern entfernt (s.o.)
+log "Watchdog bleibt AN – kein nowatchdog ergänzt"
+log "Tweaks (amd_pstate fix, EPP, no Conky)"
+
+# ---------- 5. PACCACHE HOOK (sicherer Cache-Erhalt bei jedem Update) ----------
+step "5/8 PACCACHE HOOK - skipped (no hook on request)"
+info "Paccache hook not created on request (no -rk2)"
+# DISABLED on request
+# sudo mkdir -p /etc/pacman.d/hooks (disabled – Hook auf Wunsch nicht erstellt)
+log "Hook skipped (on request)"
+# DISABLED
+
+# ---------- 6. SICHERE WARTUNG - Caches, Runtimes und Logs ohne Systemdateien zu beschädigen ----------
+step "6/8 SAFE MAINTENANCE - free space, protect rollback and data"
+info "Before: Packages=$(pacman -Qq | wc -l) Explizit=$(pacman -Qqe | wc -l) Cache=$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1) Orphans=$(pacman -Qtdq 2>/dev/null | wc -l)"
+# BleachBit kann je nach Cleaner Logins, Sprache oder Nutzerdaten betreffen: niemals blind/root ausführen.
+info "BleachBit wird nicht automatisch ausgeführt – erst Vorschau prüfen: bleachbit --preview <cleaner>"
+# Keine extern nachgeladenen Skripte mit deinem Benutzerkonto ausführen.
+
+# Nur klar abgegrenzte Thumbnail-/Browser-Caches und den Papierkorb bereinigen; System-Tmp verwaltet systemd.
+# Kein pauschales ~/.cache/*: App-Caches können Downloads, Sitzungen oder teure Spiel-Precompilations enthalten.
+rm -rf -- "$HOME/.thumbnails/"* "$HOME/.cache/thumbnails/"* "$HOME/.local/share/Trash/"* \
+  "$HOME/.cache/mozilla/"* "$HOME/.cache/chromium/"* "$HOME/.cache/google-chrome/"* 2>/dev/null || true
+sudo systemd-tmpfiles --clean 2>/dev/null || true
+
+# Waisen sind ein Hinweis, keine Freigabe zum Löschen: zur Prüfung protokollieren, nicht automatisch entfernen.
+ORPHANS_FILE="$LOG_DIR/orphans_${RUN_ID}.txt"
+orphans="$(pacman -Qdtq 2>/dev/null || true)"
+if [[ -n "$orphans" ]]; then
+  printf '%s\n' "$orphans" | tee "$ORPHANS_FILE"
+  warn "Mögliche Waisen in $ORPHANS_FILE – nach Prüfung optional: sudo pacman -Rns <paketname>"
+else
+  : > "$ORPHANS_FILE"
+  log "Keine Pacman-Waisen gefunden"
+fi
+# Defekte Symlinks haben praktisch keinen Speicherbedarf und können absichtlich sein: nur melden.
+BROKEN_LINKS_FILE="$LOG_DIR/broken-symlinks_${RUN_ID}.txt"
+find "$HOME" -type l ! -exec test -e {} \; -print 2>/dev/null > "$BROKEN_LINKS_FILE" || true
+if [[ -s "$BROKEN_LINKS_FILE" ]]; then
+  warn "Defekte Symlinks nur protokolliert: $BROKEN_LINKS_FILE"
+else
+  rm -f "$BROKEN_LINKS_FILE"
+fi
+
+info "Flatpak: unbenutzte Runtimes und Daten bereinigen"
+flatpak uninstall --unused --delete-data -y 2>/dev/null || true
+# Verbliebene App-Caches sind standardisierte XDG-Caches, werden beim Fresh-Install aber nicht blind gelöscht.
+# Der Bericht zeigt später, ob sich ein gezielter Aufruf von clean-flatpak-caches --yes lohnt.
+FLATPAK_CACHE_REPORT="$LOG_DIR/flatpak-caches_${RUN_ID}.txt"
+: > "$FLATPAK_CACHE_REPORT"
+if [[ -d "$HOME/.var/app" && ! -L "$HOME/.var/app" ]]; then
+  while IFS= read -r -d '' cache_dir; do
+    du -sh -- "$cache_dir" >> "$FLATPAK_CACHE_REPORT" 2>/dev/null || printf 'unlesbar: %q\n' "$cache_dir" >> "$FLATPAK_CACHE_REPORT"
+  done < <(find "$HOME/.var/app" -mindepth 2 -maxdepth 2 -type d -name cache -print0 2>/dev/null)
+fi
+if [[ -s "$FLATPAK_CACHE_REPORT" ]]; then
+  info "Flatpak-App-Caches nur protokolliert: $FLATPAK_CACHE_REPORT (optional: clean-flatpak-caches --yes)"
+else
+  rm -f "$FLATPAK_CACHE_REPORT"
+  log "Keine verbliebenen Flatpak-App-Caches gefunden"
+fi
+# Steam-Shadercache bleibt erhalten: Er gehört oft zu installierten Spielen und ein Löschen erzeugt Ruckler beim Neuaufbau.
+info "Steam-Shadercache und Wine-/Proton-Prefixe bleiben unangetastet (optional gezielt: clean-wine-temp --yes <prefix>)"
+# Zwei Paketversionen als Rollback-Schutz behalten; passt zum Pacman-Hook.
+sudo paccache -rk2 2>/dev/null || true
+# Journald/Coredumps ausschließlich über ihre eigenen Werkzeuge begrenzen; /var/log bleibt strukturell intakt.
+sudo journalctl --rotate 2>/dev/null || true
+sudo journalctl --vacuum-time=3d 2>/dev/null || true
+sudo journalctl --vacuum-size=100M 2>/dev/null || true
+sudo coredumpctl --vacuum-time=3d 2>/dev/null || true
+# Fontconfig löscht und erstellt seine Caches selbst neu. Kein rohes sudo rm in /var/cache/fontconfig.
+if command -v fc-cache &>/dev/null; then
+  fc-cache -r 2>/dev/null || warn "Benutzer-Fontcache konnte nicht vollständig neu erstellt werden"
+  sudo fc-cache -r -s 2>/dev/null || warn "System-Fontcache konnte nicht vollständig neu erstellt werden"
+else
+  warn "fc-cache fehlt – Fontcache nicht neu erstellt"
+fi
+sudo rm -rf /etc/pacman.d/gnupg/*.log 2>/dev/null || true
+# Der Pacman-Cache wurde oben bewusst auf zwei Versionen begrenzt; kein pacman -Scc und kein rm -rf /var/cache/*.
+# Flatpak-Runtimes und ungenutzte Daten wurden oben über Flatpak selbst bereinigt.
+info "Logs sicher bereinigen - nur alte komprimierte Reste, keine Verzeichnisstruktur oder Timer-Zustände löschen"
+sudo find /var/log -type f -name "*.old" -delete 2>/dev/null || true
+sudo find /var/log -type f -name "*.gz" -delete 2>/dev/null || true
+# Fontconfig wurde oben bereits mit seinem eigenen Neuaufbau behandelt.
+rm -rf -- "$HOME/.cache/icon-cache/"* "$HOME/.local/share/baloo/"* "$HOME/.config/baloofilerc" 2>/dev/null || true
+# Man-/Info-/Doc-Dateien, Locales und Firmware bleiben vollständig: Paketbestand und Hardware bleiben zuverlässig.
+info "Dokumentation, Sprachdateien und Firmware bleiben paketkonsistent"
+
+# BTRFS: Optionen protokollieren statt /etc/fstab blind zu verändern. Das schützt Subvolumes und Bootfähigkeit.
+if [[ "$(findmnt -n -o FSTYPE / 2>/dev/null)" == "btrfs" ]]; then
+  BTRFS_MOUNTS_FILE="$LOG_DIR/btrfs-mounts_${RUN_ID}.txt"
+  findmnt -rn -t btrfs -o TARGET,SOURCE,OPTIONS | tee "$BTRFS_MOUNTS_FILE"
+  ROOT_BTRFS_OPTIONS="$(findmnt -n -o OPTIONS / 2>/dev/null || true)"
+  case ",$ROOT_BTRFS_OPTIONS," in
+    *,noatime,*) log "BTRFS root: noatime aktiv" ;;
+    *) info "BTRFS root: noatime nicht gesetzt – für eine bewusste Prüfung siehe $BTRFS_MOUNTS_FILE" ;;
+  esac
+  case ",$ROOT_BTRFS_OPTIONS," in
+    *compress=zstd*) log "BTRFS root: Zstd-Kompression aktiv" ;;
+    *) info "BTRFS root: keine Zstd-Kompression erkannt – keine automatische fstab-Änderung" ;;
+  esac
+  # Moderne BTRFS-Systeme haben den freien Speicherbaum bereits; space_cache=v2 wird nicht erzwungen.
+  sudo systemctl enable --now fstrim.timer 2>/dev/null || warn "fstrim.timer konnte nicht aktiviert werden"
+  # Auf frischer Installation fast keine Fragmentierung – Balance nur wenn sinnvoll (>10% belegt), sonst skip (spart Zeit beim ersten Run)
+  if [[ $(df / | awk 'NR==2{print $5}' | tr -d '%') -gt 10 ]]; then
+    info "BTRFS Balance für wenig belegte Chunks (System >10% belegt)"
+    sudo btrfs balance start -dusage=50 -musage=50 / 2>/dev/null || warn "BTRFS Balance nicht ausgeführt – Details im Log"
+  else
+    info "BTRFS Balance übersprungen – frische Installation (<10% belegt), keine Fragmentierung"
+  fi
+else
+  info "Kein BTRFS erkannt – fstab und Balance übersprungen"
+fi
+info "Node/Yarn/Electron-Caches bereinigen (ohne App-Einstellungen zu löschen)"
+rm -rf ~/.npm/_cacache/* ~/.yarn/cache/* ~/.node-gyp/* ~/.cache/electron/* 2>/dev/null || true
+sudo fstrim -av 2>/dev/null || true
+# .pacnew/.pacsave nur protokollieren, nie automatisch löschen.
+PACNEW_FILE="$LOG_DIR/pacnew_${RUN_ID}.txt"
+info "Prüfe auf .pacnew/.pacsave-Dateien"
+find /etc -regextype posix-extended -regex '.+\.pac(new|save)' -print 2>/dev/null > "$PACNEW_FILE" || true
+if [[ -s "$PACNEW_FILE" ]]; then
+  warn ".pacnew/.pacsave gefunden – manuell prüfen: sudo pacdiff -o"
+  cat "$PACNEW_FILE"
+else
+  log "Keine .pacnew/.pacsave-Dateien"
+  rm -f "$PACNEW_FILE"
+fi
+info "After: Packages=$(pacman -Qq | wc -l) Explizit=$(pacman -Qqe | wc -l) Orphans=$(pacman -Qtdq 2>/dev/null | wc -l)"
+info "Nachher Disk: $(df -h / | tail -1 | awk '{print $3"/"$2" used, "$4" free"}' 2>/dev/null) RAM Boot: $(free -h | awk '/Mem:/{print $3"/"$2}' 2>/dev/null)"
+log "Safe maintenance done – caches cleaned, rollback protection and system files preserved"
+
+# ---------- 7. VERIFY INTEGRIERT - Alles in einem Skript ----------
+step "7/8 VERIFY - check if everything succeeded (all in ONE script)"
+PASS=0; FAIL=0
+check(){
+  local label="$1"
+  shift
+  if "$@" &>/dev/null; then
+    echo -e "${GREEN}[✓]${NC} $label"
+    PASS=$((PASS+1))
+  else
+    echo -e "${RED}[✖]${NC} $label"
+    FAIL=$((FAIL+1))
+  fi
+}
+# vesktop_plugin_config_valid entfernt – oeffentliche Version ohne Vencord
+
+check "Brave" bash -c 'command -v brave-browser >/dev/null || command -v brave >/dev/null'
+check "Alacritty" command -v alacritty
+check "Mission Center (Taskmanager)" bash -c 'flatpak info io.missioncenter.MissionCenter >/dev/null 2>&1 || command -v missioncenter >/dev/null || pacman -Q plasma-systemmonitor >/dev/null 2>&1'
+check "Konsole behalten" command -v konsole
+check "Flameshot" command -v flameshot
+check "Gimp" command -v gimp
+# check "Vesktop-Plugin-Konfiguration" entfernt – oeffentliche Version
+# Proton Mail check removed – optional, not everyone wants it
+# Proton VPN check removed – optional
+check "Bore Kernel" pacman -Q linux-cachyos-bore
+check "NVIDIA Treiber" bash -c 'pacman -Q nvidia-utils >/dev/null 2>&1 && { nvidia-smi >/dev/null 2>&1 || lsmod 2>/dev/null | grep -q nvidia || pacman -Q nvidia-open-dkms >/dev/null 2>&1 || pacman -Q nvidia-dkms >/dev/null 2>&1 || ls /usr/lib/modules/*/extramodules/*nvidia* >/dev/null 2>&1; }'
+check "Minecraft Bedrock für Windows" bash -c 'command -v bedrock-on-linux >/dev/null 2>&1 || pacman -Q bedrock-on-linux-bin >/dev/null 2>&1'
+check "Mitigations off konfiguriert ($BOOTLOADER)" grep -qw mitigations=off "$BOOTLOADER_CONFIG"
+check "ZRAM" test -f /etc/systemd/zram-generator.conf
+check "Gamemode" command -v gamemoded
+check "Spicetify-Helfer" test -x "$HOME/.local/bin/configure-spicetify"
+check "BleachBit + Stacer" bash -c 'command -v bleachbit >/dev/null && { pacman -Q stacer-bin >/dev/null 2>&1 || pacman -Q stacer >/dev/null 2>&1; }'
+check "AUR Helper (paru/yay)" bash -c 'command -v paru >/dev/null || command -v yay >/dev/null'
+# Paccache Hook auf Wunsch entfernt -> nur Info, kein FAIL
+if [[ -f /etc/pacman.d/hooks/pacclean.hook ]]; then check "Paccache Hook (pacclean.hook)" bash -c 'test -f /etc/pacman.d/hooks/pacclean.hook'; else info "Paccache hook not created on request (no -rk2)"; fi
+if modinfo binder_linux &>/dev/null; then
+  check "Waydroid Binder-Autoload" grep -qx binder_linux /etc/modules-load.d/waydroid-binder.conf
+else
+  info "Waydroid Binder: kein ladbares binder_linux-Modul – keine Autoload-Datei erwartet"
+fi
+if [[ "$(findmnt -n -o FSTYPE / 2>/dev/null)" == "btrfs" ]]; then
+  check "SSD-Trim Timer" systemctl is-enabled fstrim.timer
+fi
+echo -e "Verify: ${GREEN}$PASS OK${NC} / ${RED}$FAIL FAIL${NC}"
+log "Verify done"
+
+# Einen echten Check für nach dem Reboot erzeugen (die frühere Abschlussmeldung verwies auf eine nicht vorhandene Datei).
+cat <<'EOF' > "$HOME/system-check.sh"
+#!/usr/bin/env bash
+set -uo pipefail
+GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+PASS=0; FAIL=0
+check(){
+  local label="$1"
+  shift
+  if "$@" &>/dev/null; then
+    echo -e "${GREEN}[✓]${NC} $label"
+    PASS=$((PASS+1))
+  else
+    echo -e "${RED}[✖]${NC} $label"
+    FAIL=$((FAIL+1))
+  fi
+}
+check "Bore-Kernel läuft" bash -c 'uname -r | grep -q -- "bore"'
+check "Standard-Kernel installiert" pacman -Q linux-cachyos
+check "Bore-Kernel installiert" pacman -Q linux-cachyos-bore
+check "NVIDIA Treiber" bash -c 'pacman -Q nvidia-utils >/dev/null 2>&1 && { nvidia-smi >/dev/null 2>&1 || lsmod 2>/dev/null | grep -q nvidia || pacman -Q nvidia-open-dkms >/dev/null 2>&1; }'
+check "Mitigations off aktiv" grep -qw mitigations=off /proc/cmdline
+check "ZRAM aktiv" bash -c 'swapon --show=NAME 2>/dev/null | grep -q zram'
+check "Mission Center" bash -c 'flatpak info io.missioncenter.MissionCenter >/dev/null 2>&1 || pacman -Q plasma-systemmonitor >/dev/null 2>&1'
+check "Alacritty" command -v alacritty
+check "Konsole behalten" command -v konsole
+check "Spicetify-Helfer" test -x "$HOME/.local/bin/configure-spicetify"
+check "Brave" bash -c 'command -v brave-browser >/dev/null || command -v brave >/dev/null'
+# Proton Mail check removed – optional, not everyone wants it
+# Proton VPN check removed – optional
+if modinfo binder_linux &>/dev/null; then
+  check "Waydroid Binder-Autoload" grep -qx binder_linux /etc/modules-load.d/waydroid-binder.conf
+fi
+if [[ "$(findmnt -n -o FSTYPE / 2>/dev/null)" == "btrfs" ]]; then
+  check "SSD-Trim Timer" systemctl is-enabled fstrim.timer
+  # noatime Warnung — SSD-Schonung
+  if ! findmnt -n -o OPTIONS / 2>/dev/null | grep -qw noatime; then
+    echo -e "\033[1;33m[!] BTRFS ohne noatime — erhöht SSD-Schreiblast\033[0m"
+  fi
+fi
+check "AUR Helper (paru/yay)" bash -c 'command -v paru >/dev/null || command -v yay >/dev/null'
+info "Paccache Hook auf Wunsch nicht erstellt (Detail in /etc/pacman.d/hooks/)"
+check "Bootloader Config" bash -c 'sudo test -f /boot/limine.conf 2>/dev/null || test -f /boot/limine.conf 2>/dev/null || sudo ls /boot/loader/entries/*.conf >/dev/null 2>&1 || bootctl status 2>&1 | grep -qi limine'
+check "Minecraft Bedrock für Windows" bash -c 'command -v bedrock-on-linux >/dev/null 2>&1 || pacman -Q bedrock-on-linux-bin >/dev/null 2>&1'
+echo -e "\nErgebnis: ${GREEN}$PASS OK${NC} / ${RED}$FAIL FAIL${NC}"
+exit "$FAIL"
+EOF
+chmod +x "$HOME/system-check.sh"
+log "Post-reboot check created: $HOME/system-check.sh"
+
+# ---------- 8. BOOTLOADER AKTUALISIEREN + REBOOT ----------
+step "8/8 BOOTLOADER - apply kernel params for $BOOTLOADER"
+case "$BOOTLOADER" in
+  limine)
+    if command -v limine-mkinitcpio &>/dev/null; then
+      sudo limine-mkinitcpio || warn "Limine-Einträge konnten nicht neu erzeugt werden"
+    else
+      warn "limine-mkinitcpio fehlt – $BOOTLOADER_CONFIG manuell anwenden"
+    fi
+    ;;
+  systemd-boot)
+    if command -v sdboot-manage &>/dev/null; then
+      sudo sdboot-manage gen || warn "systemd-boot-Einträge konnten nicht neu erzeugt werden"
+    else
+      warn "sdboot-manage fehlt – $BOOTLOADER_CONFIG manuell anwenden"
+    fi
+    if command -v bootctl &>/dev/null; then
+      sudo bootctl update || warn "bootctl update fehlgeschlagen"
+    fi
+    ;;
+  grub)
+    if command -v grub-mkconfig &>/dev/null; then
+      sudo grub-mkconfig -o /boot/grub/grub.cfg || warn "GRUB-Konfiguration konnte nicht neu erzeugt werden"
+    else
+      warn "grub-mkconfig fehlt – $BOOTLOADER_CONFIG manuell anwenden"
+    fi
+    ;;
+  refind)
+    log "rEFInd übernimmt Änderungen an $BOOTLOADER_CONFIG direkt; kein Rebuild nötig"
+    ;;
+  kernel-install)
+    if command -v mkinitcpio &>/dev/null; then
+      sudo mkinitcpio -P || warn "kernel-install/mkinitcpio konnte nicht neu erzeugt werden"
+    else
+      warn "Kein mkinitcpio gefunden – $BOOTLOADER_CONFIG manuell anwenden"
+    fi
+    ;;
+  *)
+    warn "Bootloader unbekannt – keine blind geratenen Rebuild-Befehle ausgeführt"
+    ;;
+esac
+
+# ---------- 9/9 FINAL UPDATE - nochmal ALLES am Schluss ----------
+step "9/9 FINAL UPDATE - only Flatpak + initramfs (no second pacman -Syu, phase 1 already covers everything)"
+flatpak update -y || true
+# Only rebuild initramfs if drivers/kernel changed – no repeated pacman -Syu (rarely new packages same day)
+sudo mkinitcpio -P || true
+if command -v limine-mkinitcpio >/dev/null 2>&1; then sudo limine-mkinitcpio || true; fi
+log "Final update done — everything up to date ✅"
+
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}  ✓ Setup done!${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "Full log: ${CYAN}$LOG_FILE${NC}"
+echo -e "Error log:       ${CYAN}$ERROR_LOG${NC}"
+echo -e "1. ${YELLOW}sudo reboot${NC} -> choose Bore kernel in boot menu"
+echo -e "2. Afterwards: ${CYAN}~/system-check.sh${NC}"
+echo -e "3. Open Spotify once/log in, close, then: ${CYAN}configure-spicetify${NC}"
+if command -v bedrock-on-linux >/dev/null 2>&1; then
+  echo -e "4. Minecraft Bedrock for Windows: ${CYAN}bedrock-on-linux${NC} start and log in with Microsoft account"
+else
+  echo -e "4. ${YELLOW}BedrockOnLinux was not installed – check AUR error in log.${NC}"
+fi
+echo -e "5. Check if needed: ${CYAN}$ORPHANS_FILE${NC}, ${CYAN}$PACNEW_FILE${NC}, ${CYAN}${BTRFS_MOUNTS_FILE:-}${NC} und ${CYAN}${FLATPAK_CACHE_REPORT:-}${NC}"
+echo -e "Helper commands: ${CYAN}update-arch  clean-arch  fix-key  update-mirrors  configure-spicetify  clean-flatpak-caches  clean-wine-temp${NC}"
