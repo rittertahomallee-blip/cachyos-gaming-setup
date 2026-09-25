@@ -14,12 +14,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Parse setup script
-        run: bash -n cachyos-gaming-setup.sh
-      - name: Exercise argument parser without changing the system
-        run: |
-          ./cachyos-gaming-setup.sh --help
-          if ./cachyos-gaming-setup.sh --profile invalid; then
-            echo 'Invalid profile unexpectedly succeeded.' >&2
-            exit 1
-          fi
+      - name: Run static Bash regression checks
+        run: python3 tests/test_static.py

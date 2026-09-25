@@ -37,7 +37,7 @@ The script uses numbered phases and logs every phase to `~/cachyos-logs/`:
 4. **Base and helpers** – Enables `multilib`, configures Flathub and installs the documented local helper commands.
 5. **Applications** – Installs the selected desktop and gaming applications. AUR-only packages remain optional and use Flatpak fallbacks where available.
 6. **Performance profile** – Configures ZRAM, hardware-aware drivers and the balanced or extreme profile. The default is `balanced`; `mitigations=off` requires two explicit flags.
-7. **Safe maintenance** – Logs possible orphans and `.pacnew` files, uses tool-specific journal/Flatpak cleanup, enables trim on BTRFS and avoids blind deletion of game data.
+7. **Safe maintenance** – Always records possible orphans, `.pacnew` files, BTRFS state and cache sizes. Cache deletion, Flatpak data cleanup, journal trimming, package-cache cleanup and BTRFS balancing require `--run-maintenance`.
 8. **Verification and bootloader** – Checks only applicable hardware/profile-dependent components and generates `~/system-check.sh` for after the reboot.
 9. **Final inventory** – Writes Pacman, AUR/foreign and Flatpak manifests plus a run metadata file for later rebuilds and troubleshooting.
 
@@ -99,7 +99,8 @@ The script asks once for `sudo` and asks for a typed `yes` before it changes the
 # Example: explicitly opt in to the legacy, more invasive setup choices
 ./cachyos-gaming-setup.sh --profile extreme --enable-mitigations-off \
   --remove-snapper --remove-preinstalled-apps --remove-other-kernels \
-  --disable-unused-services --enable-firewall --force-brave-extensions --yes
+  --disable-unused-services --enable-firewall --force-brave-extensions \
+  --run-maintenance --yes
 ```
 
 It writes logs and review artifacts to `~/cachyos-logs/`:
@@ -108,6 +109,7 @@ It writes logs and review artifacts to `~/cachyos-logs/`:
 - `errors_YYYYMMDD_HHMMSS.log` – unhandled command errors
 - `changed-files_*.txt` and `backups_*` – overwritten configuration files and their pre-change copies
 - `pacman-explicit_*.txt`, `pacman-foreign_*.txt`, `flatpak_*.txt`, `run_*.txt` – resolved package manifests and run metadata
+- maintenance reports for orphaned packages, BTRFS mount state, Flatpak cache size, `.pacnew`/`.pacsave` files and broken symlinks
 
 First run takes about 15–30 minutes depending on internet and packages.
 
@@ -129,6 +131,8 @@ configure-spicetify
 
 **Removal is explicit:** `--remove-snapper` first creates a Snapper `pre` snapshot and only then removes Snapper-related packages with normal dependency checks. `--remove-preinstalled-apps` removes the selected app replacements and Firefox. `--remove-other-kernels` keeps the running kernel and the two CachyOS kernels. `--disable-unused-services` and `--enable-firewall` are separate opt-ins.
 
+**Maintenance is explicit:** The installer records maintenance reports by default. Pass `--run-maintenance` only when you want it to clear browser/thumbnail caches and Trash, prune unused Flatpak data, trim journals, limit the Pacman cache, remove old compressed log archives and optionally balance a sufficiently used BTRFS filesystem.
+
 **Installed (selection):** Brave, Alacritty, Konsole, Fish, Starship, Mission Center, Flameshot, Gimp, VLC, LibreOffice, CopyQ, Spotify, Spicetify, Steam, Heroic, PrismLauncher, Sober (Roblox), optional BedrockOnLinux (AUR), Waydroid, QEMU, Bottles, Lutris, Bauh, Variety and Kvantum. AUR packages can fail independently or fall back to Flatpak; inspect the manifest and verification output.
 
 **Not touched:** System languages (`de`+`en` stay package-managed), man pages, firmware is not deleted.
@@ -139,7 +143,7 @@ configure-spicetify
 
 Located in `~/.local/bin` and immediately in `PATH`:
 
-- `update-arch` – `pacman -Syu` + `flatpak update` + `mkinitcpio -P` + `paru/yay -Syu`
+- `update-arch` – focused `pacman -Syu` + Flatpak + AUR updates and initramfs rebuild; it does **not** reconfigure drivers, repair Flatpak or modify firewall policy
 - `clean-arch` – shows orphans, cleans `paccache -rk2`, `journal --vacuum`, never runs `bleachbit` automatically
 - `fix-key` – repair keyring
 - `update-mirrors` – `cachyos-rate-mirrors` / `reflector`

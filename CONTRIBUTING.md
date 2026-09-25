@@ -16,9 +16,10 @@ No Discord DMs needed – everything via GitHub stays transparent.
 2. Keep automatic hardware detection – no hard-coded drivers without `lspci`/`lscpu` check
 3. No Vencord / Vesktop / MessageLogger and no Spotify ad-blocking in public version (ToS-safe). Theming only is fine.
 4. Do not suppress errors from required package, bootloader or configuration changes. Optional capability checks such as `command -v` may be quiet.
-5. Keep logs: every phase must write to `~/cachyos-logs/`, no hidden `rm -rf`
-6. Update `README.md` if you change phases or helper commands
-7. Keep documentation and user-facing output consistent, update the README for behavior changes, and test on a fresh CachyOS VM if possible
+5. Keep logs and pre-change backups: every phase must remain reviewable, with no hidden destructive maintenance
+6. Keep cleanup actions behind an explicit option and never silently remove user data, snapshots or package rollback state
+7. Update `README.md` and `tests/test_static.py` if you change phases, helper commands or CLI options
+8. Keep documentation and user-facing output consistent, and test on a fresh CachyOS VM if possible
 
 ## Style
 
