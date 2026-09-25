@@ -1,10 +1,5 @@
 # CachyOS Gaming Setup
 
-![CachyOS](https://img.shields.io/badge/CachyOS-Gaming-1abc9c?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
-![Bash](https://img.shields.io/badge/Bash-%3E%3D5.0-4EAA25?style=for-the-badge&logo=gnu-bash)
-![Maintained](https://img.shields.io/badge/Maintained-yes-brightgreen?style=for-the-badge)
-
 > Reproducible setup script for a fresh **CachyOS KDE (BTRFS)** installation. Performs a full system update, configures kernel, drivers and selected applications, and leaves a clean, documented system.
 
 ![Overview](skript-uebersicht.png)
