@@ -1,6 +1,8 @@
 # CachyOS Gaming Setup
 
-> Reproducible setup script for a fresh **CachyOS KDE (BTRFS)** installation. Performs a full system update, configures kernel, drivers and selected applications, and leaves a clean, documented system.
+> Repeatable, opinionated setup script for a fresh **CachyOS KDE (BTRFS)** installation. It performs a full update, configures selected drivers and applications, and records manifests, backups and logs so the result can be reviewed and recreated later.
+>
+> Package repositories, Flathub and the AUR are live sources, so this is not a bit-for-bit immutable build.
 
 ![Overview](skript-uebersicht.png)
 
@@ -27,17 +29,17 @@
 
 ## What it does
 
-The script is divided into 9 phases. Each phase is logged (`~/cachyos-logs/`):
+The script uses numbered phases and logs every phase to `~/cachyos-logs/`:
 
-1. **0/8 System Check** – Secure Boot, boot partition, BTRFS, internet, keyring, mirrors
-2. **1/8 System Update** – `pacman -Syu` with clean abort on error
-3. **1.5/8 Cleanup** – Keeps `linux-cachyos` + `linux-cachyos-bore`, removes only with normal dependency check (no `-Rdd`): `snapper`, `btrfs-assistant`, `yakuake`, `spectacle` and others. Fonts and services are cleaned, no blind deletion.
-4. **2/8 Base** – `multilib`, `flatpak`, `base-devel`, `git`, Flathub, 7 local helpers: `update-arch`, `clean-arch`, `fix-key`, `update-mirrors`, `configure-spicetify`, `clean-flatpak-caches`, `clean-wine-temp`
-5. **3/8 Applications** – Brave (with 7 enforced extensions), Alacritty + Konsole, Fish + Fisher + Starship, Mission Center, Flameshot, Gimp, VLC, Ark, LibreOffice, CopyQ, Spotify (Flatpak), Spicetify, Thunderbird (Universal Mail Client), KDE Connect, Syncthing, RustDesk, Sunshine, Steam, Heroic, PrismLauncher + JDK 8/11/17/21, Sober (Roblox), Waydroid, QEMU, Bottles, Lutris, and more.
-6. **4/8 Performance Tweaks** – ZRAM `zstd`, `cpupower` `schedutil`, EPP `balance_performance`, boost on, `vm.swappiness=10`, `vm.vfs_cache_pressure=50`, Ananicy-cpp CGroups Fix, Gamemode, NVIDIA `Coolbits 28` only on NVIDIA, mitigations only for detected bootloader (Limine/systemd-boot/GRUB/rEFInd).
-7. **5/8 Paccache Hook** – Skipped (conscious decision, no `-rk2` hook)
-8. **6/8 Safe Maintenance** – Only thumbnail/browser caches, orphans only logged, Flatpak unused cleaned, `fstrim.timer` on, BTRFS balance only if >10% used, journal only `vacuum`.
-9. **7/8 Verify + 8/8 Bootloader + 9/9 Final** – Integrated verify, `~/system-check.sh` for after reboot, bootloader rebuild, final only `flatpak update` + `mkinitcpio -P`.
+1. **System check and confirmation** – Checks Secure Boot, boot space, connectivity and keyrings, then shows a change summary. It refuses to run as `root` and requires confirmation unless `--yes` is supplied.
+2. **System update** – Uses a full `pacman -Syu` transaction and aborts on a failed required update.
+3. **Kernel and cleanup** – Installs the standard and Bore CachyOS kernels. Existing kernels, Snapper, desktop applications, fonts and services are **kept by default**; each removal needs an explicit option.
+4. **Base and helpers** – Enables `multilib`, configures Flathub and installs the documented local helper commands.
+5. **Applications** – Installs the selected desktop and gaming applications. AUR-only packages remain optional and use Flatpak fallbacks where available.
+6. **Performance profile** – Configures ZRAM, hardware-aware drivers and the balanced or extreme profile. The default is `balanced`; `mitigations=off` requires two explicit flags.
+7. **Safe maintenance** – Logs possible orphans and `.pacnew` files, uses tool-specific journal/Flatpak cleanup, enables trim on BTRFS and avoids blind deletion of game data.
+8. **Verification and bootloader** – Checks only applicable hardware/profile-dependent components and generates `~/system-check.sh` for after the reboot.
+9. **Final inventory** – Writes Pacman, AUR/foreign and Flatpak manifests plus a run metadata file for later rebuilds and troubleshooting.
 
 **Not included in the public version:** Vencord / Vesktop / MessageLogger. To comply with Discord's Terms of Service, all third-party client modifications have been removed. Additionally, Proton Mail/VPN components were replaced by the universal Thunderbird client to suit everyone's needs. If you want Discord or Proton specific apps, install them natively via Flatpak:
 `flatpak install flathub com.discordapp.Discord`
@@ -69,7 +71,7 @@ A wide range of peripherals – e.g. printer or headphones – gets its driver a
 
 - Fresh **CachyOS** with KDE Plasma, BTRFS on `/`, boot partition ideally 2 GB (`/boot` with at least 500 MB free)
 - Internet connection
-- `sudo` rights
+- `sudo` rights (run the script as the normal desktop user; **do not** prefix the whole command with `sudo`)
 - Secure Boot **off** in BIOS (otherwise `Invalid signature`)
 - Backup if you already have data
 
@@ -87,16 +89,25 @@ cd cachyos-gaming-setup
 # 2. Make executable (already +x, just to be safe)
 chmod +x cachyos-gaming-setup.sh
 
-# 3. Run
-./cachyos-gaming-setup.sh
-# or
-sudo ./cachyos-gaming-setup.sh
+# 3. Review the change summary and run the safe default profile
+./cachyos-gaming-setup.sh --profile balanced
 ```
 
-The script asks once for `sudo`, writes two logs:
+The script asks once for `sudo` and asks for a typed `yes` before it changes the system. For an unattended run, review the options first and pass `--yes` explicitly.
 
-- `~/cachyos-logs/install_YYYYMMDD_HHMMSS.log` – everything
-- `~/cachyos-logs/errors_YYYYMMDD_HHMMSS.log` – errors only
+```bash
+# Example: explicitly opt in to the legacy, more invasive setup choices
+./cachyos-gaming-setup.sh --profile extreme --enable-mitigations-off \
+  --remove-snapper --remove-preinstalled-apps --remove-other-kernels \
+  --disable-unused-services --enable-firewall --force-brave-extensions --yes
+```
+
+It writes logs and review artifacts to `~/cachyos-logs/`:
+
+- `install_YYYYMMDD_HHMMSS.log` – complete terminal output
+- `errors_YYYYMMDD_HHMMSS.log` – unhandled command errors
+- `changed-files_*.txt` and `backups_*` – overwritten configuration files and their pre-change copies
+- `pacman-explicit_*.txt`, `pacman-foreign_*.txt`, `flatpak_*.txt`, `run_*.txt` – resolved package manifests and run metadata
 
 First run takes about 15–30 minutes depending on internet and packages.
 
@@ -114,9 +125,11 @@ configure-spicetify
 
 ## What gets installed / removed
 
-**Removed (only with `pacman -Rns`, no force):** `snapper`, `cachyos-snapper-support`, `limine-snapper-sync`, `yakuake`, `spectacle`, `kmail`, `kontact` and other PIM, `elisa`, `dragon`, `discover`, `octopi`, `gnu-free-fonts`. Before removal it checks if the package exists and if the running kernel must be kept.
+**Kept by default:** existing kernels, Snapper/BTRFS rollback tooling, Firefox, preinstalled desktop apps, fonts and services.
 
-**Installed (selection):** Brave, Alacritty, Konsole, Fish, Starship, Mission Center, Flameshot, Gimp, VLC, LibreOffice, CopyQ, Spotify, Spicetify, Steam, Heroic, PrismLauncher, Sober (Roblox), BedrockOnLinux (AUR), Waydroid, QEMU, Bottles, Lutris, Bauh, Variety, Kvantum. Full list differs from private version (public is shortened for ToS).
+**Removal is explicit:** `--remove-snapper` first creates a Snapper `pre` snapshot and only then removes Snapper-related packages with normal dependency checks. `--remove-preinstalled-apps` removes the selected app replacements and Firefox. `--remove-other-kernels` keeps the running kernel and the two CachyOS kernels. `--disable-unused-services` and `--enable-firewall` are separate opt-ins.
+
+**Installed (selection):** Brave, Alacritty, Konsole, Fish, Starship, Mission Center, Flameshot, Gimp, VLC, LibreOffice, CopyQ, Spotify, Spicetify, Steam, Heroic, PrismLauncher, Sober (Roblox), optional BedrockOnLinux (AUR), Waydroid, QEMU, Bottles, Lutris, Bauh, Variety and Kvantum. AUR packages can fail independently or fall back to Flatpak; inspect the manifest and verification output.
 
 **Not touched:** System languages (`de`+`en` stay package-managed), man pages, firmware is not deleted.
 
@@ -145,7 +158,8 @@ After reboot:
 
 ```bash
 ~/system-check.sh
-# expected: Bore kernel active, standard+Bore installed, NVIDIA/driver depending on hardware, mitigations off only if set in phase 4, ZRAM active, fstrim.timer on
+# expected: Bore kernel active, standard+Bore installed, matching GPU driver,
+# CPU mitigations active by default, ZRAM active, fstrim.timer on
 ```
 
 The integrated verify block runs directly; after reboot use `~/system-check.sh` to validate (watchdog without `nowatchdog` is intentional).
@@ -160,9 +174,9 @@ To avoid problems on GitHub:
 - **No Discord ToS violation:** This public version contains **no** Vencord, Vesktop or MessageLogger. Private version stays local.
 - **No proprietary redistribution:** The script only downloads packages from official Arch/CachyOS/Flathub/AUR sources. It bundles no binaries.
 - **Trademarks:** CachyOS, Brave, Steam, NVIDIA, AMD, Intel are trademarks of their owners. Project is not affiliated.
-- **No `curl | bash` from strangers:** Only external download is `fisher.fish` from `jorgebucaran/fisher` (MIT) and is stored only as Fish function.
-- **Transparency:** Every change is logged, no hidden `rm -rf`, no `pacman -Rdd`. Orphans and `.pacnew` are only logged.
-- **Privacy:** Script only reads local hardware via `lspci`/`lsusb`/`lscpu`. It sends nothing outward except normal `pacman`/`flatpak` downloads. No system report is uploaded.
+- **Pinned third-party bootstrap:** Fisher is downloaded from a fixed upstream commit over HTTPS. Third-party Fish plugins are no longer installed or executed automatically.
+- **Transparency:** Logs, configuration backups, a changed-file list and resolved package manifests are written per run. No `pacman -Rdd` or blind `--overwrite '*'` is used. Orphans and `.pacnew` are only logged.
+- **Privacy:** Script only reads local hardware via `lspci`/`lsusb`/`lscpu`. It sends nothing outward except normal repository, Flatpak, AUR and the pinned Fisher download. No system report is uploaded.
 
 If you make the repo public, do not add `info/cachyos_ALLES_bericht.txt` with serial numbers. Use `inxi -Fz --filter` for bug reports.
 
@@ -180,7 +194,9 @@ If you make the repo public, do not add `info/cachyos_ALLES_bericht.txt` with se
 
 ## Uninstall / Rollback
 
-Script creates a backup before JSON changes (e.g. `*.before-cachyos-gaming-setup-*.bak`). For packages there is no automatic rollback except `paccache -rk2` (two versions kept). Removed packages can be reinstalled: `sudo pacman -S <package>`.
+Before overwriting tracked configuration files, the script copies their prior version to the root-readable `~/cachyos-logs/backups_<run-id>/` directory and records it in `changed-files_<run-id>.txt`. `--remove-snapper` creates a Snapper pre-snapshot before it removes anything.
+
+There is no automatic package rollback. The generated manifests let you inspect or reinstall packages; removed packages can be reinstalled with `sudo pacman -S <package>`.
 
 ---
 
@@ -189,9 +205,10 @@ Script creates a backup before JSON changes (e.g. `*.before-cachyos-gaming-setup
 Pull requests welcome. Please:
 
 1. `bash -n cachyos-gaming-setup.sh` must pass
-2. No `2>/dev/null` on important steps without reason, errors must go to `ERROR_LOG`
+2. Do not suppress errors from required package, bootloader or configuration changes
 3. Keep hardware detection, no fixed drivers without `lspci` check
-4. No Vencord/MessageLogger in public version
+4. Preserve the explicit opt-ins for destructive and security-sensitive actions
+5. No Vencord/MessageLogger in public version
 
 ---
 
